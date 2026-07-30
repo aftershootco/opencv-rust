@@ -45,7 +45,7 @@ semver = "1"
 shlex = { version = "1.3", default-features = false }
 # vcpkg-0.2.9 is the first one that has accessible find_vcpkg_root()
 vcpkg = "0.2.9"
-# aftershoot: env-free vcpkg discovery (locate target/vcpkg_installed like the in-house
+# env-free vcpkg discovery (locate target/vcpkg_installed like the in-house
 # -sys crates) so building on Windows needs no VCPKG_ROOT env var.
 lib-resolver = { git = "ssh://git@github.com/aftershootco/lib-resolver.git" }
 

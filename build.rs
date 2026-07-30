@@ -287,13 +287,13 @@ fn build_wrapper(mut cc: cc::Build, modules: &[SupportedModule], module_aliases:
 	eprintln!("=== Total cpp build time: {:?}", start.elapsed());
 }
 
-/// aftershoot: make opencv-rust's vcpkg probe work env-free with lib-resolver's vcpkg
+/// Make opencv-rust's vcpkg probe work env-free with lib-resolver's vcpkg
 /// layout. lib-resolver installs to `<target>/vcpkg_installed/<triplet>` (not
 /// `$VCPKG_ROOT/installed`), so locate that tree the way the in-house -sys crates do,
 /// bridge it to the standard layout with a directory junction, and point the probe at it
 /// via process-local env. No-op if VCPKG_ROOT is already set or the tree is absent, so
 /// Linux/macOS (pkg-config) and explicit-VCPKG_ROOT setups are unaffected.
-fn aftershoot_setup_vcpkg_env() {
+fn setup_vcpkg_env_from_lib_resolver() {
 	if env::var_os("VCPKG_ROOT").is_some() {
 		return;
 	}
@@ -336,13 +336,13 @@ fn aftershoot_setup_vcpkg_env() {
 	}
 }
 
-/// aftershoot: make the clang *binary* (opencv-binding-generator's `clang_sys::Clang::find`)
+/// Make the clang *binary* (opencv-binding-generator's `clang_sys::Clang::find`)
 /// reachable without the user putting LLVM on PATH. libclang itself is auto-found by
 /// clang-sys at the default location; only the clang.exe binary needs this. Searches the
 /// vendored LLVM, then LIBCLANG_PATH, then the default winget install dir, and prepends the
 /// first directory containing clang.exe to PATH. No-op if none are found (falls back to
 /// whatever is already on PATH).
-fn aftershoot_ensure_clang_on_path() {
+fn ensure_clang_on_path() {
 	let mut candidates: Vec<PathBuf> = Vec::new();
 	if let Ok(Some(installed)) = lib_resolver::locate_vcpkg_installed() {
 		// <ws>/target/vcpkg_installed/<triplet> -> <ws>/.vendor/tools/llvm/bin
@@ -409,9 +409,9 @@ fn main() -> Result<()> {
 		}
 	}
 
-	// aftershoot: env-free native-dep discovery (no VCPKG_ROOT / clang on PATH needed).
-	aftershoot_setup_vcpkg_env();
-	aftershoot_ensure_clang_on_path();
+	// env-free native-dep discovery (no VCPKG_ROOT / clang on PATH needed).
+	setup_vcpkg_env_from_lib_resolver();
+	ensure_clang_on_path();
 
 	let opencv = Library::probe()?;
 	eprintln!("=== OpenCV library configuration: {opencv:#?}");
