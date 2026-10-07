@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
+use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Instant;
@@ -287,52 +288,102 @@ fn build_wrapper(mut cc: cc::Build, modules: &[SupportedModule], module_aliases:
 	eprintln!("=== Total cpp build time: {:?}", start.elapsed());
 }
 
-/// Make opencv-rust's vcpkg probe work env-free with lib-resolver's vcpkg
-/// layout. lib-resolver installs to `<target>/vcpkg_installed/<triplet>` (not
-/// `$VCPKG_ROOT/installed`), so locate that tree the way the in-house -sys crates do,
-/// bridge it to the standard layout with a directory junction, and point the probe at it
-/// via process-local env. No-op if VCPKG_ROOT is already set or the tree is absent, so
-/// Linux/macOS (pkg-config) and explicit-VCPKG_ROOT setups are unaffected.
-fn setup_vcpkg_env_from_lib_resolver() {
+/// Probe OpenCV. opencv-rust's own probes go first, so an OpenCV found through env vars,
+/// pkg-config or cmake (nix, Homebrew, a distro package) never triggers a vcpkg build.
+/// lib-resolver's vcpkg tree is the fallback, and goes first when `LIB_RESOLVER_MODE(S)`
+/// put vcpkg first. A user-managed vcpkg (`VCPKG_ROOT` set) is left to the vcpkg probes.
+fn probe_opencv() -> Result<Library> {
 	if env::var_os("VCPKG_ROOT").is_some() {
-		return;
+		return Library::probe();
 	}
-	let Ok(Some(installed)) = lib_resolver::locate_vcpkg_installed() else {
-		return;
-	};
-	let (Some(triplet), Some(vcpkg_installed_root)) = (installed.file_name(), installed.parent()) else {
-		return;
-	};
-	let Some(vcpkg_root) = vcpkg_installed_root.parent().map(|t| t.join(".vcpkg")) else {
-		return;
-	};
-	if !vcpkg_root.join("scripts/buildsystems/vcpkg.cmake").exists() {
-		return;
+	let order = lib_resolver::Strategy::from_env(&[])?;
+	if order.first() == Some(&lib_resolver::Strategy::Vcpkg) {
+		return probe_lib_resolver_vcpkg();
 	}
-	// Bridge <target>/.vcpkg/installed -> <target>/vcpkg_installed so the vcpkg crate
-	// finds packages at the standard $VCPKG_ROOT/installed/<triplet> location.
+	Library::probe().or_else(|probe_err| {
+		eprintln!("=== Falling back to lib-resolver's vcpkg tree because: {probe_err}");
+		probe_lib_resolver_vcpkg().map_err(|vcpkg_err| format!("{probe_err}; lib-resolver vcpkg: {vcpkg_err}").into())
+	})
+}
+
+/// OpenCV from lib-resolver's vcpkg tree. lib-resolver installs the `opencv4` port if the
+/// tree lacks it, waiting for any install already running. The vcpkg crate's probe then
+/// links exactly what the port installed (`opencv_world4` and its static deps); the
+/// cmake-based probes list every module separately, which a `world` build doesn't have.
+fn probe_lib_resolver_vcpkg() -> Result<Library> {
+	let opencv = lib_resolver::Resolver::new("opencv")
+		.pkg_config("opencv4")
+		.vcpkg("opencv4")
+		.order(&[lib_resolver::Strategy::Vcpkg])
+		.no_metadata()
+		.probe()?;
+	let installed = opencv.vcpkg_installed().ok_or("LIB_RESOLVER_MODE(S) excludes vcpkg")?;
+	bridge_vcpkg_tree(installed)?;
+	Library::probe_vcpkg_from_env().or_else(|vcpkg_err| {
+		eprintln!("=== vcpkg probe of lib-resolver's tree failed, trying every probe: {vcpkg_err}");
+		Library::probe()
+	})
+}
+
+/// Point the vcpkg crate at lib-resolver's tree, through process-local env. The crate
+/// expects `$VCPKG_ROOT/installed/<triplet>`; lib-resolver installs to
+/// `<target>/vcpkg_installed/<triplet>` next to its `<target>/.vcpkg` clone, so link
+/// `.vcpkg/installed` to `vcpkg_installed`.
+fn bridge_vcpkg_tree(installed: &Path) -> Result<()> {
+	let (Some(triplet), Some(installed_root)) = (installed.file_name(), installed.parent()) else {
+		return Err(format!("not a vcpkg_installed/<triplet> tree: {}", installed.display()).into());
+	};
+	let vcpkg_root = installed_root
+		.parent()
+		.map(|target| target.join(".vcpkg"))
+		.filter(|root| root.join("scripts/buildsystems/vcpkg.cmake").exists())
+		.ok_or_else(|| format!("no lib-resolver vcpkg clone next to {}", installed_root.display()))?;
 	let link = vcpkg_root.join("installed");
 	if !link.exists() {
-		let _ = std::process::Command::new("cmd")
-			.args(["/c", "mklink", "/J"])
-			.arg(link.as_os_str())
-			.arg(vcpkg_installed_root.as_os_str())
-			.status();
+		// Another build script may create it at the same time.
+		link_dir(installed_root, &link).or_else(|e| {
+			if link.exists() {
+				Ok(())
+			} else {
+				Err(e)
+			}
+		})?;
 	}
-	env::set_var("VCPKG_ROOT", vcpkg_root.as_os_str());
+	env::set_var("VCPKG_ROOT", &vcpkg_root);
 	env::set_var("VCPKGRS_TRIPLET", triplet);
 
-	// Make vcpkg's protoc (opencv's protobuf find_dependency) discoverable by the cmake
-	// probe without the user having to put it on PATH.
+	// opencv's protobuf find_dependency needs vcpkg's protoc on PATH.
 	let protoc_dir = installed.join("tools").join("protobuf");
-	if protoc_dir.join("protoc.exe").exists() {
-		if let Some(path) = env::var_os("PATH") {
-			let mut paths = vec![protoc_dir];
-			paths.extend(env::split_paths(&path));
-			if let Ok(joined) = env::join_paths(paths) {
-				env::set_var("PATH", joined);
-			}
-		}
+	if ["protoc", "protoc.exe"].iter().any(|exe| protoc_dir.join(exe).is_file()) {
+		prepend_to_path(protoc_dir);
+	}
+	Ok(())
+}
+
+/// A directory junction on Windows (no admin rights needed, unlike a symlink).
+#[cfg(windows)]
+fn link_dir(target: &Path, link: &Path) -> Result<()> {
+	let status = std::process::Command::new("cmd")
+		.args(["/c", "mklink", "/J"])
+		.arg(link)
+		.arg(target)
+		.status()?;
+	if status.success() {
+		Ok(())
+	} else {
+		Err(format!("mklink /J {} {} failed: {status}", link.display(), target.display()).into())
+	}
+}
+
+#[cfg(not(windows))]
+fn link_dir(target: &Path, link: &Path) -> Result<()> {
+	Ok(std::os::unix::fs::symlink(target, link)?)
+}
+
+fn prepend_to_path(dir: PathBuf) {
+	let path = env::var_os("PATH").unwrap_or_default();
+	if let Ok(joined) = env::join_paths(iter::once(dir).chain(env::split_paths(&path))) {
+		env::set_var("PATH", joined);
 	}
 }
 
@@ -354,17 +405,8 @@ fn ensure_clang_on_path() {
 		candidates.push(PathBuf::from(libclang));
 	}
 	candidates.push(PathBuf::from(r"C:\Program Files\LLVM\bin"));
-	for dir in candidates {
-		if dir.join("clang.exe").is_file() {
-			if let Some(path) = env::var_os("PATH") {
-				let mut paths = vec![dir];
-				paths.extend(env::split_paths(&path));
-				if let Ok(joined) = env::join_paths(paths) {
-					env::set_var("PATH", joined);
-				}
-			}
-			return;
-		}
+	if let Some(dir) = candidates.into_iter().find(|dir| dir.join("clang.exe").is_file()) {
+		prepend_to_path(dir);
 	}
 }
 
@@ -410,10 +452,9 @@ fn main() -> Result<()> {
 	}
 
 	// env-free native-dep discovery (no VCPKG_ROOT / clang on PATH needed).
-	setup_vcpkg_env_from_lib_resolver();
 	ensure_clang_on_path();
 
-	let opencv = Library::probe()?;
+	let opencv = probe_opencv()?;
 	eprintln!("=== OpenCV library configuration: {opencv:#?}");
 	emit_opencv_branch(&opencv);
 

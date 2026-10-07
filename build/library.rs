@@ -637,6 +637,17 @@ impl Library {
 		Self::probe_system(include_paths, link_paths, link_libs)
 	}
 
+	/// Only the vcpkg crate probe, with the same `OPENCV_*` overrides as [`Self::probe`].
+	pub fn probe_vcpkg_from_env() -> Result<Self> {
+		let include_paths = env::var("OPENCV_INCLUDE_PATHS").ok();
+		let include_paths = include_paths.as_deref().map(EnvList::from);
+		let link_paths = env::var("OPENCV_LINK_PATHS").ok();
+		let link_paths = link_paths.as_deref().map(EnvList::from);
+		let link_libs = env::var("OPENCV_LINK_LIBS").ok();
+		let link_libs = link_libs.as_deref().map(EnvList::from);
+		Self::probe_vcpkg(include_paths, link_paths, link_libs)
+	}
+
 	pub fn emit_cargo_metadata(&self) {
 		self.cargo_metadata.iter().for_each(|meta| {
 			println!("{meta}");
