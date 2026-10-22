@@ -288,8 +288,8 @@ fn build_wrapper(mut cc: cc::Build, modules: &[SupportedModule], module_aliases:
 	eprintln!("=== Total cpp build time: {:?}", start.elapsed());
 }
 
-/// Probe OpenCV. opencv-rust's own probes go first, so an OpenCV found through env vars,
-/// pkg-config or cmake (nix, Homebrew, a distro package) never triggers a vcpkg build.
+/// Probe OpenCV. opencv-rust's own probes go first, so a supported OpenCV found through env
+/// vars, pkg-config or cmake (nix, Homebrew, a distro package) never triggers a vcpkg build.
 /// lib-resolver's vcpkg tree is the fallback, and goes first when `LIB_RESOLVER_MODE(S)`
 /// put vcpkg first. A user-managed vcpkg (`VCPKG_ROOT` set) is left to the vcpkg probes.
 fn probe_opencv() -> Result<Library> {
@@ -300,10 +300,31 @@ fn probe_opencv() -> Result<Library> {
 	if order.first() == Some(&lib_resolver::Strategy::Vcpkg) {
 		return probe_lib_resolver_vcpkg();
 	}
-	Library::probe().or_else(|probe_err| {
+	probe_supported().or_else(|probe_err| {
 		eprintln!("=== Falling back to lib-resolver's vcpkg tree because: {probe_err}");
 		probe_lib_resolver_vcpkg().map_err(|vcpkg_err| format!("{probe_err}; lib-resolver vcpkg: {vcpkg_err}").into())
 	})
+}
+
+/// OpenCV versions these bindings build against. 0.98's OpenCV 5 support predates the
+/// 5.0.0 release (e.g. Arch's `opencv` package) and no longer compiles against it.
+const SUPPORTED_PROBED_OPENCV: &str = "^4";
+
+/// opencv-rust's own probes, treating an OpenCV outside [`SUPPORTED_PROBED_OPENCV`] as not
+/// found, so it falls back to lib-resolver's vcpkg tree instead of failing to compile.
+fn probe_supported() -> Result<Library> {
+	let opencv = Library::probe()?;
+	if VersionReq::parse(SUPPORTED_PROBED_OPENCV)?.matches(&opencv.version) {
+		Ok(opencv)
+	} else {
+		Err(
+			format!(
+				"found OpenCV {}, but this crate builds against {SUPPORTED_PROBED_OPENCV} only",
+				opencv.version
+			)
+			.into(),
+		)
+	}
 }
 
 /// OpenCV from lib-resolver's vcpkg tree. lib-resolver installs the `opencv4` port if the
@@ -321,7 +342,7 @@ fn probe_lib_resolver_vcpkg() -> Result<Library> {
 	bridge_vcpkg_tree(installed)?;
 	Library::probe_vcpkg_from_env().or_else(|vcpkg_err| {
 		eprintln!("=== vcpkg probe of lib-resolver's tree failed, trying every probe: {vcpkg_err}");
-		Library::probe()
+		probe_supported()
 	})
 }
 
