@@ -11,6 +11,7 @@ use docs::handle_running_in_docsrs;
 use enums::{InherentFeature, SUPPORTED_INHERENT_FEATURES, SUPPORTED_MODULES};
 use generator::BindingGenerator;
 use header::IncludePath;
+use lib_resolver::{locate_vcpkg_installed, Resolver, Strategy};
 use library::Library;
 use opencv_binding_generator::SupportedModule;
 use semver::{Version, VersionReq};
@@ -296,8 +297,8 @@ fn probe_opencv() -> Result<Library> {
 	if env::var_os("VCPKG_ROOT").is_some() {
 		return Library::probe();
 	}
-	let order = lib_resolver::Strategy::from_env(&[])?;
-	if order.first() == Some(&lib_resolver::Strategy::Vcpkg) {
+	let order = Strategy::from_env(&[])?;
+	if order.first() == Some(&Strategy::Vcpkg) {
 		return probe_lib_resolver_vcpkg();
 	}
 	probe_supported().or_else(|probe_err| {
@@ -331,11 +332,12 @@ fn probe_supported() -> Result<Library> {
 /// tree lacks it, waiting for any install already running. The vcpkg crate's probe then
 /// links exactly what the port installed (`opencv_world4` and its static deps); the
 /// cmake-based probes list every module separately, which a `world` build doesn't have.
+/// The probe is written the way lib-resolver's README "Build-script conventions" describes,
+/// returning its error because the caller falls back to opencv-rust's own probes.
 fn probe_lib_resolver_vcpkg() -> Result<Library> {
-	let opencv = lib_resolver::Resolver::new("opencv")
-		.pkg_config("opencv4")
+	let opencv = Resolver::new("opencv")
 		.vcpkg("opencv4")
-		.order(&[lib_resolver::Strategy::Vcpkg])
+		.order(&[Strategy::Vcpkg])
 		.no_metadata()
 		.probe()?;
 	let installed = opencv.vcpkg_installed().ok_or("LIB_RESOLVER_MODE(S) excludes vcpkg")?;
@@ -416,7 +418,7 @@ fn prepend_to_path(dir: PathBuf) {
 /// whatever is already on PATH).
 fn ensure_clang_on_path() {
 	let mut candidates: Vec<PathBuf> = Vec::new();
-	if let Ok(Some(installed)) = lib_resolver::locate_vcpkg_installed() {
+	if let Ok(Some(installed)) = locate_vcpkg_installed() {
 		// <ws>/target/vcpkg_installed/<triplet> -> <ws>/.vendor/tools/llvm/bin
 		if let Some(ws) = installed.ancestors().nth(3) {
 			candidates.push(ws.join(".vendor").join("tools").join("llvm").join("bin"));
