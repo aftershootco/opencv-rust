@@ -11,6 +11,7 @@ use docs::handle_running_in_docsrs;
 use enums::{InherentFeature, SUPPORTED_INHERENT_FEATURES, SUPPORTED_MODULES};
 use generator::BindingGenerator;
 use header::IncludePath;
+use lib_resolver::{locate_vcpkg_installed, Resolver, Strategy};
 use library::Library;
 use opencv_binding_generator::SupportedModule;
 use semver::{Version, VersionReq};
@@ -288,40 +289,62 @@ fn build_wrapper(mut cc: cc::Build, modules: &[SupportedModule], module_aliases:
 	eprintln!("=== Total cpp build time: {:?}", start.elapsed());
 }
 
-/// Probe OpenCV. opencv-rust's own probes go first, so an OpenCV found through env vars,
-/// pkg-config or cmake (nix, Homebrew, a distro package) never triggers a vcpkg build.
+/// Probe OpenCV. opencv-rust's own probes go first, so a supported OpenCV found through env
+/// vars, pkg-config or cmake (nix, Homebrew, a distro package) never triggers a vcpkg build.
 /// lib-resolver's vcpkg tree is the fallback, and goes first when `LIB_RESOLVER_MODE(S)`
 /// put vcpkg first. A user-managed vcpkg (`VCPKG_ROOT` set) is left to the vcpkg probes.
 fn probe_opencv() -> Result<Library> {
 	if env::var_os("VCPKG_ROOT").is_some() {
 		return Library::probe();
 	}
-	let order = lib_resolver::Strategy::from_env(&[])?;
-	if order.first() == Some(&lib_resolver::Strategy::Vcpkg) {
+	let order = Strategy::from_env(&[])?;
+	if order.first() == Some(&Strategy::Vcpkg) {
 		return probe_lib_resolver_vcpkg();
 	}
-	Library::probe().or_else(|probe_err| {
+	probe_supported().or_else(|probe_err| {
 		eprintln!("=== Falling back to lib-resolver's vcpkg tree because: {probe_err}");
 		probe_lib_resolver_vcpkg().map_err(|vcpkg_err| format!("{probe_err}; lib-resolver vcpkg: {vcpkg_err}").into())
 	})
+}
+
+/// OpenCV versions these bindings build against. 0.98's OpenCV 5 support predates the
+/// 5.0.0 release (e.g. Arch's `opencv` package) and no longer compiles against it.
+const SUPPORTED_PROBED_OPENCV: &str = "^4";
+
+/// opencv-rust's own probes, treating an OpenCV outside [`SUPPORTED_PROBED_OPENCV`] as not
+/// found, so it falls back to lib-resolver's vcpkg tree instead of failing to compile.
+fn probe_supported() -> Result<Library> {
+	let opencv = Library::probe()?;
+	if VersionReq::parse(SUPPORTED_PROBED_OPENCV)?.matches(&opencv.version) {
+		Ok(opencv)
+	} else {
+		Err(
+			format!(
+				"found OpenCV {}, but this crate builds against {SUPPORTED_PROBED_OPENCV} only",
+				opencv.version
+			)
+			.into(),
+		)
+	}
 }
 
 /// OpenCV from lib-resolver's vcpkg tree. lib-resolver installs the `opencv4` port if the
 /// tree lacks it, waiting for any install already running. The vcpkg crate's probe then
 /// links exactly what the port installed (`opencv_world4` and its static deps); the
 /// cmake-based probes list every module separately, which a `world` build doesn't have.
+/// The probe is written the way lib-resolver's README "Build-script conventions" describes,
+/// returning its error because the caller falls back to opencv-rust's own probes.
 fn probe_lib_resolver_vcpkg() -> Result<Library> {
-	let opencv = lib_resolver::Resolver::new("opencv")
-		.pkg_config("opencv4")
+	let opencv = Resolver::new("opencv")
 		.vcpkg("opencv4")
-		.order(&[lib_resolver::Strategy::Vcpkg])
+		.order(&[Strategy::Vcpkg])
 		.no_metadata()
 		.probe()?;
 	let installed = opencv.vcpkg_installed().ok_or("LIB_RESOLVER_MODE(S) excludes vcpkg")?;
 	bridge_vcpkg_tree(installed)?;
 	Library::probe_vcpkg_from_env().or_else(|vcpkg_err| {
 		eprintln!("=== vcpkg probe of lib-resolver's tree failed, trying every probe: {vcpkg_err}");
-		Library::probe()
+		probe_supported()
 	})
 }
 
@@ -395,7 +418,7 @@ fn prepend_to_path(dir: PathBuf) {
 /// whatever is already on PATH).
 fn ensure_clang_on_path() {
 	let mut candidates: Vec<PathBuf> = Vec::new();
-	if let Ok(Some(installed)) = lib_resolver::locate_vcpkg_installed() {
+	if let Ok(Some(installed)) = locate_vcpkg_installed() {
 		// <ws>/target/vcpkg_installed/<triplet> -> <ws>/.vendor/tools/llvm/bin
 		if let Some(ws) = installed.ancestors().nth(3) {
 			candidates.push(ws.join(".vendor").join("tools").join("llvm").join("bin"));
