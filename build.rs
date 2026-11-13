@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
+use std::fs;
 use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -290,13 +291,10 @@ fn build_wrapper(mut cc: cc::Build, modules: &[SupportedModule], module_aliases:
 }
 
 /// Probe OpenCV. opencv-rust's own probes go first, so a supported OpenCV found through env
-/// vars, pkg-config or cmake (nix, Homebrew, a distro package) never triggers a vcpkg build.
-/// lib-resolver's vcpkg tree is the fallback, and goes first when `LIB_RESOLVER_MODE(S)`
-/// put vcpkg first. A user-managed vcpkg (`VCPKG_ROOT` set) is left to the vcpkg probes.
+/// vars, pkg-config, cmake or a user-managed vcpkg (`VCPKG_ROOT`, which those probes then
+/// try before pkg-config) never triggers a vcpkg build. lib-resolver's vcpkg tree is the
+/// fallback, and goes first when `LIB_RESOLVER_MODE(S)` put vcpkg first.
 fn probe_opencv() -> Result<Library> {
-	if env::var_os("VCPKG_ROOT").is_some() {
-		return Library::probe();
-	}
 	let order = Strategy::from_env(&[])?;
 	if order.first() == Some(&Strategy::Vcpkg) {
 		return probe_lib_resolver_vcpkg();
@@ -349,18 +347,28 @@ fn probe_lib_resolver_vcpkg() -> Result<Library> {
 }
 
 /// Point the vcpkg crate at lib-resolver's tree, through process-local env. The crate
-/// expects `$VCPKG_ROOT/installed/<triplet>`; lib-resolver installs to
-/// `<target>/vcpkg_installed/<triplet>` next to its `<target>/.vcpkg` clone, so link
-/// `.vcpkg/installed` to `vcpkg_installed`.
+/// expects `$VCPKG_ROOT/installed/<triplet>` under a root holding `.vcpkg-root`;
+/// lib-resolver installs to `<target>/vcpkg_installed/<triplet>`, so link `installed` to
+/// `vcpkg_installed` inside lib-resolver's `<target>/.vcpkg` clone. When lib-resolver ran a
+/// user-managed vcpkg (`VCPKG_ROOT` set) there's no clone, and a stand-in root in `OUT_DIR`
+/// takes the link instead, leaving the user's vcpkg untouched.
 fn bridge_vcpkg_tree(installed: &Path) -> Result<()> {
 	let (Some(triplet), Some(installed_root)) = (installed.file_name(), installed.parent()) else {
 		return Err(format!("not a vcpkg_installed/<triplet> tree: {}", installed.display()).into());
 	};
-	let vcpkg_root = installed_root
+	let clone = installed_root
 		.parent()
 		.map(|target| target.join(".vcpkg"))
-		.filter(|root| root.join("scripts/buildsystems/vcpkg.cmake").exists())
-		.ok_or_else(|| format!("no lib-resolver vcpkg clone next to {}", installed_root.display()))?;
+		.filter(|root| root.join("scripts/buildsystems/vcpkg.cmake").exists());
+	let vcpkg_root = match clone {
+		Some(clone) => clone,
+		None => {
+			let stand_in = OUT_DIR.join("vcpkg-root");
+			fs::create_dir_all(&stand_in)?;
+			fs::write(stand_in.join(".vcpkg-root"), "")?;
+			stand_in
+		}
+	};
 	let link = vcpkg_root.join("installed");
 	if !link.exists() {
 		// Another build script may create it at the same time.
