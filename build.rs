@@ -290,19 +290,34 @@ fn build_wrapper(mut cc: cc::Build, modules: &[SupportedModule], module_aliases:
 	eprintln!("=== Total cpp build time: {:?}", start.elapsed());
 }
 
-/// Probe OpenCV. opencv-rust's own probes go first, so a supported OpenCV found through env
-/// vars, pkg-config, cmake or a user-managed vcpkg (`VCPKG_ROOT`, which those probes then
-/// try before pkg-config) never triggers a vcpkg build. lib-resolver's vcpkg tree is the
-/// fallback, and goes first when `LIB_RESOLVER_MODE(S)` put vcpkg first.
+/// Probe OpenCV in lib-resolver's strategy order, like every other native library:
+/// `LIB_RESOLVER_MODE(S)` when set, otherwise env, pkg-config, vcpkg. Each strategy maps to
+/// the OpenCV probe that matches it, and the first supported OpenCV wins:
+/// - env: the `OPENCV_INCLUDE_PATHS`, `OPENCV_LINK_PATHS` and `OPENCV_LINK_LIBS` triple.
+/// - pkg-config: opencv-rust's system probes (pkg-config, cmake, and a user-managed vcpkg
+///   under `VCPKG_ROOT`, which they then try before pkg-config).
+/// - vcpkg: lib-resolver's vcpkg tree.
 fn probe_opencv() -> Result<Library> {
-	let order = Strategy::from_env(&[])?;
-	if order.first() == Some(&Strategy::Vcpkg) {
-		return probe_lib_resolver_vcpkg();
+	let order = Strategy::from_env(&[Strategy::Env, Strategy::PkgConfig, Strategy::Vcpkg])?;
+	let mut misses = Vec::with_capacity(order.len());
+	for strategy in order {
+		let found = match strategy {
+			Strategy::Env => Library::probe_environment_from_env().and_then(supported),
+			Strategy::PkgConfig => probe_supported(),
+			Strategy::Vcpkg => probe_lib_resolver_vcpkg(),
+		};
+		match found {
+			Ok(opencv) => {
+				eprintln!("=== Found OpenCV through lib-resolver strategy: {strategy}");
+				return Ok(opencv);
+			}
+			Err(e) => {
+				eprintln!("=== No usable OpenCV through lib-resolver strategy {strategy}: {e}");
+				misses.push(format!("{strategy}: {e}"));
+			}
+		}
 	}
-	probe_supported().or_else(|probe_err| {
-		eprintln!("=== Falling back to lib-resolver's vcpkg tree because: {probe_err}");
-		probe_lib_resolver_vcpkg().map_err(|vcpkg_err| format!("{probe_err}; lib-resolver vcpkg: {vcpkg_err}").into())
-	})
+	Err(format!("no supported OpenCV found ({})", misses.join("; ")).into())
 }
 
 /// OpenCV versions these bindings build against. 0.98's OpenCV 5 support predates the
@@ -310,9 +325,13 @@ fn probe_opencv() -> Result<Library> {
 const SUPPORTED_PROBED_OPENCV: &str = "^4";
 
 /// opencv-rust's own probes, treating an OpenCV outside [`SUPPORTED_PROBED_OPENCV`] as not
-/// found, so it falls back to lib-resolver's vcpkg tree instead of failing to compile.
+/// found, so the next strategy gets its turn instead of the crate failing to compile.
 fn probe_supported() -> Result<Library> {
-	let opencv = Library::probe()?;
+	Library::probe().and_then(supported)
+}
+
+/// `opencv`, if it's a version these bindings build against.
+fn supported(opencv: Library) -> Result<Library> {
 	if VersionReq::parse(SUPPORTED_PROBED_OPENCV)?.matches(&opencv.version) {
 		Ok(opencv)
 	} else {
@@ -331,14 +350,18 @@ fn probe_supported() -> Result<Library> {
 /// links exactly what the port installed (`opencv_world4` and its static deps); the
 /// cmake-based probes list every module separately, which a `world` build doesn't have.
 /// The probe is written the way lib-resolver's README "Build-script conventions" describes,
-/// returning its error because the caller falls back to opencv-rust's own probes.
+/// returning its error because the caller moves on to the next strategy.
 fn probe_lib_resolver_vcpkg() -> Result<Library> {
 	let opencv = Resolver::new("opencv")
 		.vcpkg("opencv4")
 		.order(&[Strategy::Vcpkg])
 		.no_metadata()
 		.probe()?;
-	let installed = opencv.vcpkg_installed().ok_or("LIB_RESOLVER_MODE(S) excludes vcpkg")?;
+	// `LIB_RESOLVER_MODES` replaces the order above, so lib-resolver can find opencv through
+	// `OPENCV_DIR` or an `opencv` pkg-config module before it gets to vcpkg.
+	let installed = opencv
+		.vcpkg_installed()
+		.ok_or("lib-resolver found opencv outside its vcpkg tree")?;
 	bridge_vcpkg_tree(installed)?;
 	Library::probe_vcpkg_from_env().or_else(|vcpkg_err| {
 		eprintln!("=== vcpkg probe of lib-resolver's tree failed, trying every probe: {vcpkg_err}");
